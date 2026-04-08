@@ -16,10 +16,13 @@
 | **Benchmark 第一检索** | MemPalace | BM25 + 向量混合搜索 |
 | **4层记忆栈** | MemPalace | Hot / Warm / Cold / Archive |
 | **MMR 多样性重排** | SM6 | 避免单一主题重复 |
+| **时间衰减（Temporal Decay）** | SM6 | 近期记忆优先，半衰期30天 |
 | **Levenshtein 去重** | SM6 | >85% 相似度不重复记录 |
+| **Exact Match 优先** | SM6 | 关键词完整匹配优先级提升 |
 | **元数据自动清洗** | SM6 | 去除系统元数据前缀 |
 | **Hook 自动注入** | SM6 | `message:preprocessed` 全自动触发 |
 | **ChromaDB 删除** | SM6 | 可删除过时记忆 |
+| **子系统健康检查** | SM6 | ChromaDB 抽屉状态一览 |
 | **完全本地运行** | MemPalace | 无需 API key |
 
 ---
@@ -48,17 +51,31 @@ chmod +x scripts/install.sh
 
 ## 📖 使用方法
 
-### 搜索记忆
+### 增强搜索（默认）
 ```bash
+# 搜索 - 自动应用：时间衰减 + Exact Match 优先 + MMR + 去重
 python3 scripts/super_mem_cli.py search "查询内容"
+
+# 指定时间衰减权重（0.0=只看相关性，1.0=只看新旧）
+python3 scripts/super_mem_cli.py search "查询" --temporal-weight 0.3
+
+# 设置记忆半衰期（天）
+python3 scripts/super_mem_cli.py search "查询" --half-life-days 30
+
+# 关闭 Exact Match 优先
+python3 scripts/super_mem_cli.py search "查询" --no-exact-boost
+
+# 关闭 MMR 多样性重排
+python3 scripts/super_mem_cli.py search "查询" --no-mmr
 ```
 
-### 查看状态
+### 健康检查
 ```bash
 python3 scripts/super_mem_cli.py status
+# 返回: 抽屉数、总记忆数、各分类状态
 ```
 
-### 启动唤醒（获取全局上下文）
+### 启动唤醒
 ```bash
 python3 scripts/super_mem_cli.py wake-up
 ```
@@ -94,11 +111,29 @@ python3 scripts/super_mem_cli.py mine --path /your/workspace
   ↓
 2. MemPalace 混合搜索 — BM25 + 向量 + 图遍历
   ↓
-3. Levenshtein 去重 — >85% 相似度去除
+3. Exact Match Boost — 关键词完整匹配 ×2.0
   ↓
-4. MMR 多样性重排 — 主题多样性保证
+4. Levenshtein 去重 — >85% 相似度去除
   ↓
-5. 注入 bodyForAgent → 模型响应
+5. Temporal Decay — 文件修改时间衰减
+  ↓
+6. MMR 多样性重排 — 主题多样性保证
+  ↓
+7. 注入 bodyForAgent → 模型响应
+```
+
+---
+
+## 📊 时间衰减机制
+
+```
+Score = base_score × (1 - λ) + decay(mtime) × λ
+
+λ = temporal_weight (默认 0.3)
+decay = 0.5^(days_elapsed / half_life_days)
+half_life_days = 30 (默认)
+
+效果: 30天前记忆的decay分约0.5，权重0.3时对总分影响约15%
 ```
 
 ---
@@ -109,14 +144,14 @@ python3 scripts/super_mem_cli.py mine --path /your/workspace
 super-mem/
 ├── scripts/
 │   ├── install.sh              # 一键安装脚本
-│   └── super_mem_cli.py        # 增强版 CLI（MMR + 去重 + 清洗）
+│   └── super_mem_cli.py       # 增强版 CLI（MMR + 去重 + 时间衰减 + Exact优先）
 ├── skills/
 │   └── mempalace-memory/
-│       └── SKILL.md           # OpenClaw Skill 说明
+│       └── SKILL.md          # OpenClaw Skill 说明
 ├── hooks/
 │   └── mempalace-recall/
-│       ├── HOOK.md             # Hook 说明
-│       └── handler.ts          # TypeScript Hook 实现
+│       ├── HOOK.md            # Hook 说明
+│       └── handler.ts         # TypeScript Hook 实现
 └── README.md
 ```
 
@@ -124,13 +159,12 @@ super-mem/
 
 ## 🆚 vs 其他记忆系统
 
-| 系统 | Stars | API Key | MMR | 去重 | 自动Hook |
-|------|-------|---------|-----|------|---------|
+| 系统 | Stars | API Key | 时间衰减 | Exact优先 | 自动Hook |
+|------|-------|---------|---------|---------|---------|
 | **SuperMem** | - | ❌ 不需要 | ✅ | ✅ | ✅ |
 | OpenViking | 21k | ⚠️ 需要 | ❌ | ❌ | ❌ |
 | MemPalace | 22k | ❌ 不需要 | ❌ | ❌ | ❌ |
 | SM6 | - | ⚠️ 需要 | ✅ | ✅ | ❌ (不稳定) |
-| Engram | 1k | ❌ 不需要 | ❌ | ❌ | ⚠️ |
 
 ---
 
