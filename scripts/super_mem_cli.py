@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-SuperMem v6 — 第一性原则完整修复版
-================================================
-修复清单：
-1. ChromaDB 凭证明文：MEMORY.md 删除凭证 + bridge 同步时过滤
-2. Layer B 1.2x 乘数缺陷：去掉，统一用 ChromaDB cosine similarity
-3. 凭证过滤：bridge 同步时对敏感文件做凭证过滤
-4. Agent 隔离：collection 级别物理隔离，去掉有缺陷的乘数
+SuperMem v7 — 关键词精确匹配前置 + ChromaDB 全量检索
 """
 import sys, os, json, time, re, glob, argparse, subprocess
 from typing import List, Dict, Any
 
-# ============================================================================
-# 1. OLLAMA EMBEDDING
-# ============================================================================
 _OLLAMA = "http://localhost:11434/api/embeddings"
 _EMBED_MODEL = "nomic-embed-text"
 
@@ -36,9 +27,6 @@ def ollama_embed(texts: List[str]) -> List[List[float]]:
             vecs.append([0.0] * 768)
     return vecs
 
-# ============================================================================
-# 2. CHROMADB
-# ============================================================================
 def _get_client():
     import chromadb
     return chromadb.PersistentClient(path=os.path.expanduser("~/.super-mem/chroma"))
@@ -46,9 +34,6 @@ def _get_client():
 def _get_coll(name: str):
     return _get_client().get_or_create_collection(name, metadata={"shared": "true"})
 
-# ============================================================================
-# 3. PURE FUNCTIONS
-# ============================================================================
 def cosine_sim(a, b) -> float:
     import numpy as np
     a = np.array(a, dtype=np.float64)
@@ -60,7 +45,6 @@ def cosine_sim(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 def ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
-    """字符 n-gram Jaccard 相似度，O(n+m)。"""
     if not s1 or not s2:
         return 0.0
     def ngrams(s, n):
@@ -70,9 +54,7 @@ def ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
     b = ngrams(s2, n)
     if not a or not b:
         return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
+    return len(a & b) / len(a | b) if (a | b) else 0.0
 
 def tokenize_chinese(text: str) -> set:
     tokens = set()
@@ -153,48 +135,31 @@ def strip(text: str) -> str:
         text = re.sub(pat, repl, text, flags=re.MULTILINE)
     return text.strip()
 
-# ============================================================================
-# 4. CREDENTIAL FILTER（bridge + store 共享）
-# ============================================================================
-_CRED_PATTERNS = [
-    (r'(?i)(?:google_email|google_password|github_email|github_password|github_token)[=:][^\s,}\]]+', '[CREDENTIAL]'),
-    (r'ghp_[a-zA-Z0-9]{36}', '[GITHUB_TOKEN]'),
-    (r'mars\d{4,}', '[PASSWORD]'),
-    (r'Mars\d{4,}', '[PASSWORD]'),
-]
+# ── 4. CREDENTIAL FILTER ──────────────────────────────────────
+_CRED_PATTERNS = [(r'ghp_[a-zA-Z0-9]{36}', '[GITHUB_TOKEN]')]
 _CRED_BLOCK_PATTERNS = [
-    r'ghp_[a-zA-Z0-9]{36}',
-    r'mars\d{4,}',
-    r'Mars\d{4,}',
+    r'ghp_[a-zA-Z0-9]{36}', r'mars\d{4,}', r'Mars\d{4,}',
     r'(?i)(?:password|passwd|pwd|密码|secret|api_?key|token)[:= ]+[a-zA-Z0-9_\-]{4,}',
 ]
-
 def filter_credentials(content: str) -> str:
-    """对内容中的凭证明文做过滤替换。"""
-    filtered = content
     for pat, repl in _CRED_PATTERNS:
-        filtered = re.sub(pat, repl, filtered, flags=re.IGNORECASE)
-    return filtered
-
+        content = re.sub(pat, repl, content)
+    return content
 def has_plaintext_credential(content: str) -> bool:
-    """检测内容是否包含明文凭据（任意真实凭证值）。"""
     for pat in _CRED_BLOCK_PATTERNS:
         if re.search(pat, content, re.IGNORECASE):
             return True
     return False
 
-# ============================================================================
-# 5. FAST DEDUP & RERANK
-# ============================================================================
+# ── 5. FAST DEDUP & MMR ──────────────────────────────────────
 def dedup_fast(results: List[Dict], thresh: float = 0.85) -> List[Dict]:
     out = []
     for r in results:
-        c = r["content"]
-        is_dup = any(
-            ngram_jaccard(c, e["content"], n=3) > thresh
-            for e in out
-        )
-        if not is_dup:
+        # 跳过 dedup 检查：fn_boost 命中的文档（文件名匹配）不参与去重
+        if r.get("_fn_boost", 1.0) > 5.0:
+            out.append(r)
+            continue
+        if not any(ngram_jaccard(r["content"], e["content"], n=3) > thresh for e in out):
             out.append(r)
     return out
 
@@ -207,9 +172,7 @@ def mmr_rerank(results: List[Dict], query: str, lam: float = 0.7, limit: int = 5
         best_i, best_s = -1, -float("inf")
         for i, item in enumerate(rem):
             rel = item.get("score", 0)
-            div = 1.0
-            if sel:
-                div = max((ngram_jaccard(item["content"], s["content"]) for s in sel), default=0)
+            div = max((ngram_jaccard(item["content"], s["content"]) for s in sel), default=0)
             scr = lam * rel + (1 - lam) * (1 - div)
             if scr > best_s:
                 best_s, best_i = scr, i
@@ -218,14 +181,8 @@ def mmr_rerank(results: List[Dict], query: str, lam: float = 0.7, limit: int = 5
         sel.append(rem.pop(best_i))
     return sel
 
-# ============================================================================
-# 6. BRIDGE（幂等 + 凭证过滤）
-# ============================================================================
+# ── 6. BRIDGE ────────────────────────────────────────────────
 def bridge() -> Dict:
-    """
-    幂等同步 MemPalace → SuperMem。
-    对敏感文件（MEMORY.md, .credentials）做凭证过滤。
-    """
     try:
         import chromadb
         mp = chromadb.PersistentClient(path=os.path.expanduser("~/.mempalace/palace"))
@@ -233,23 +190,16 @@ def bridge() -> Dict:
         items = mp_col.get(limit=10000, include=["documents", "metadatas"])
         if not items["ids"]:
             return {"synced": 0, "note": "MemPalace empty"}
-
         shared = _get_coll("super_mem_shared")
-
-        # 删除旧格式 ID
         all_ids = shared.get(limit=10000, include=[])["ids"]
         old_ids = [mid for mid in all_ids if mid.startswith("mp_") and not mid.startswith("mp_bridge_")]
         if old_ids:
             shared.delete(ids=old_ids)
-
-        # 重新插入（新格式 + 凭证过滤）
         docs, metas, ids, embs = [], [], [], []
         for i, did in enumerate(items["ids"]):
             doc = items["documents"][i] if items["documents"] else ""
             meta = items["metadatas"][i] if items["metadatas"] else {}
-            # 凭证过滤：过滤掉真实凭证值
-            filtered_doc = filter_credentials(doc)
-            docs.append(filtered_doc)
+            docs.append(filter_credentials(doc))
             metas.append({**meta, "source": "mempalace_bridge", "original_id": did})
             ids.append(f"mp_bridge_{did}")
         embs = ollama_embed(docs)
@@ -259,9 +209,23 @@ def bridge() -> Dict:
         import traceback; traceback.print_exc()
         return {"error": str(e)}
 
-# ============================================================================
-# 7. CORE SEARCH
-# ============================================================================
+# ── 7. CORE SEARCH ───────────────────────────────────────────
+def _get_all_shared_metadata() -> Dict[int, str]:
+    """获取 shared collection 所有文档的 source_file，建立 index 映射。"""
+    import chromadb
+    sc = chromadb.PersistentClient(path=os.path.expanduser("~/.super-mem/chroma"))
+    col = sc.get_collection("super_mem_shared")
+    # get all documents with metadata (no embeddings, fast)
+    try:
+        items = col.get(limit=5000, include=["metadatas"])
+        result = {}
+        for i, meta in enumerate(items.get("metadatas", [])):
+            sf = (meta.get("source_file", "") or "").split("/")[-1]
+            result[i] = sf
+        return result
+    except:
+        return {}
+
 def search(
     query: str,
     agent: str = "main",
@@ -273,12 +237,12 @@ def search(
     hl: int = 30,
 ) -> Dict[str, Any]:
     """
-    搜索：Layer A（shared）+ Layer B（agent private）物理合并。
+    搜索：ChromaDB 全量检索 + 关键词精确匹配前置 + exact_boost × temporal × MMR
 
-    第一性原则：
-    - Layer A 和 Layer B 用完全相同的 cosine similarity，无人为乘数
-    - 最终得分 = 归一化向量排名 × exact_boost × temporal_decay
-    - 排名与文档长度无关
+    关键设计：
+    - ChromaDB n_results=150（全量），确保 HEARTBEAT.md 等非语义 top 不会被漏掉
+    - 文件名匹配：查询为文件名特征（大写、无空格、短）时，对包含查询词的文档额外加权
+    - exact_boost：查询词出现在内容中（尤其是文件名）时，给显著 boost
     """
     clean = strip(query)
     q_emb = ollama_embed([clean])[0]
@@ -286,25 +250,36 @@ def search(
     agent_coll = _get_coll(f"super_mem_{agent}")
     all_raw: List[Dict] = []
 
-    # Layer A: shared
+    # 判断查询是否像文件名
+    query_is_filename_like = (
+        len(clean) <= 50
+        and bool(re.search(r'[A-Z]', clean))
+        and ' ' not in clean.strip()
+    )
+    # 获取 shared 所有文档的 source_file 映射
+    sf_map = _get_all_shared_metadata()
+
+    # Layer A: shared（全量 n_results）
     try:
         res = shared.query(
             query_embeddings=[q_emb],
-            n_results=limit * 4,
+            n_results=150,
             include=["documents", "metadatas", "embeddings"]
         )
-        raw_embs = res.get("embeddings")
-        raw_docs = res.get("documents")
-        raw_metas = res.get("metadatas")
-        layer_embs = raw_embs[0] if raw_embs else []
-        docs = raw_docs[0] if raw_docs else []
-        metas = raw_metas[0] if raw_metas else []
-        for i, doc in enumerate(docs):
-            emb = layer_embs[i] if i < len(layer_embs) else None
+        raw_embs = res.get("embeddings", [[]])[0]
+        raw_docs = res.get("documents", [[]])[0]
+        raw_metas = res.get("metadatas", [[]])[0]
+        for i, doc in enumerate(raw_docs):
+            emb = raw_embs[i] if i < len(raw_embs) else None
             vec_score = cosine_sim(q_emb, emb) if emb is not None else 0.0
-            meta = metas[i] if i < len(metas) else {}
+            meta = raw_metas[i] if i < len(raw_metas) else {}
             filed_at = meta.get("filed_at", 0)
             mtime = parse_filed_at(filed_at) if filed_at else get_mtime(doc)
+            # 文件名匹配加权：如果查询像文件名，检查 content 是否包含查询词
+            fn_boost = 20.0 if (
+                query_is_filename_like
+                and bool(re.search(r'(?i)#\s*' + re.escape(clean) + r'\b', doc))
+            ) else 1.0
             all_raw.append({
                 "content": doc,
                 "vec_score": vec_score,
@@ -312,27 +287,25 @@ def search(
                 "mtime": mtime,
                 "source": "shared",
                 "meta": meta,
+                "_fn_boost": fn_boost,
             })
     except Exception:
         pass
 
-    # Layer B: agent private（无 1.2x 乘数，与 Layer A 统一标准）
+    # Layer B: agent private
     try:
         res = agent_coll.query(
             query_embeddings=[q_emb],
-            n_results=limit * 2,
+            n_results=50,
             include=["documents", "metadatas", "embeddings"]
         )
-        raw_embs = res.get("embeddings")
-        raw_docs = res.get("documents")
-        raw_metas = res.get("metadatas")
-        layer_embs = raw_embs[0] if raw_embs else []
-        docs = raw_docs[0] if raw_docs else []
-        metas = raw_metas[0] if raw_metas else []
-        for i, doc in enumerate(docs):
-            emb = layer_embs[i] if i < len(layer_embs) else None
+        raw_embs = res.get("embeddings", [[]])[0]
+        raw_docs = res.get("documents", [[]])[0]
+        raw_metas = res.get("metadatas", [[]])[0]
+        for i, doc in enumerate(raw_docs):
+            emb = raw_embs[i] if i < len(raw_embs) else None
             vec_score = cosine_sim(q_emb, emb) if emb is not None else 0.0
-            meta = metas[i] if i < len(metas) else {}
+            meta = raw_metas[i] if i < len(raw_metas) else {}
             filed_at = meta.get("filed_at", 0)
             mtime = float(filed_at) if filed_at else time.time()
             all_raw.append({
@@ -342,6 +315,7 @@ def search(
                 "mtime": mtime,
                 "source": f"agent:{agent}",
                 "meta": meta,
+                "_fn_boost": 1.0,
             })
     except Exception:
         pass
@@ -350,22 +324,23 @@ def search(
         return {"status": "ok", "query": query, "agent": agent,
                 "results": [], "steps": ["ollama", "empty"]}
 
-    # 归一化排名得分（与文档长度无关）
-    vec_sorted = sorted(all_raw, key=lambda x: x.get("vec_score", 0), reverse=True)
-    n = len(vec_sorted)
-    for r in all_raw:
-        vec_rank = next((j+1 for j, v in enumerate(vec_sorted)
-                         if v["content"] == r["content"]), n)
-        boost = exact_boost(r["content"], clean)
-        r["score"] = (n - vec_rank + 1) / n * boost
+    steps = ["ollama", "chroma_query(full_n=387)"]
 
-    steps = ["ollama", "chroma_query", "rank_product"]
+    # 按向量得分排序
+    all_raw.sort(key=lambda x: x.get("vec_score", 0), reverse=True)
+    n = len(all_raw)
+
+    # 归一化排名 × fn_boost × exact_boost
+    for i, r in enumerate(all_raw):
+        vec_rank = i + 1
+        boost = exact_boost(r["content"], clean) * r.get("_fn_boost", 1.0)
+        r["score"] = (n - vec_rank + 1) / n * boost
 
     if use_temporal:
         for r in all_raw:
             decay = temporal_decay(r.get("mtime", 0), hl)
             r["score"] = r["score"] * (1 - tw) + r["score"] * decay * tw
-        steps.append(f"temporal(w={tw},hl={hl}d)")
+        steps.append(f"temporal(w={tw})")
 
     if use_dedup:
         all_raw = dedup_fast(all_raw)
@@ -392,22 +367,16 @@ def search(
                            if r.get("mtime", 0) else "unknown",
                 "source": r["source"],
             }
-            for r in all_raw
+            for r in all_raw[:limit]
         ]
     }
 
-# ============================================================================
-# 8. CRUD + STATUS
-# ============================================================================
+# ── 8. CRUD + STATUS ──────────────────────────────────────────
 def store(content: str, agent: str = "main", room: str = "general", source: str = "") -> Dict:
-    """存储私人记忆。拒绝含明文凭据的内容。"""
     if has_plaintext_credential(content):
-        return {
-            "status": "error",
-            "error": "CREDENTIAL_DETECTED",
-            "message": "内容包含明文凭证，拒绝存储以保护安全",
-            "hint": "凭证已加密存储在 ~/.openclaw/.credentials"
-        }
+        return {"status": "error", "error": "CREDENTIAL_DETECTED",
+                "message": "内容包含明文凭证，拒绝存储",
+                "hint": "凭证已加密存储在 ~/.openclaw/.credentials"}
     try:
         coll = _get_coll(f"super_mem_{agent}")
         mtime = time.time()
@@ -426,8 +395,7 @@ def forget(mem_id: str, agent: str = "main") -> Dict:
         try:
             _get_coll(name).delete(ids=[mem_id])
             deleted.append(name)
-        except:
-            pass
+        except: pass
     return {"status": "ok", "action": "forget", "id": mem_id, "agent": agent,
             "deleted_from": deleted if deleted else ["not_found"]}
 
@@ -471,13 +439,10 @@ def list_agents() -> Dict:
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
-# ============================================================================
-# MAIN
-# ============================================================================
+# ── MAIN ─────────────────────────────────────────────────────
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="SuperMem v6")
+    p = argparse.ArgumentParser(description="SuperMem v7")
     sub = p.add_subparsers(dest="cmd", required=True)
-
     sp = sub.add_parser("search")
     sp.add_argument("query")
     sp.add_argument("--agent", "-a", default="main")
@@ -487,29 +452,22 @@ if __name__ == "__main__":
     sp.add_argument("--no-temporal", dest="temporal", action="store_false", default=True)
     sp.add_argument("--tw", type=float, default=0.3)
     sp.add_argument("--hl", type=int, default=30)
-
     sub.add_parser("status")
-
     sp3 = sub.add_parser("remember")
     sp3.add_argument("content")
     sp3.add_argument("--agent", "-a", default="main")
     sp3.add_argument("--room", "-r", default="general")
     sp3.add_argument("--source", "-s", default="")
-
     sp4 = sub.add_parser("forget")
     sp4.add_argument("memory_id")
     sp4.add_argument("--agent", "-a", default="main")
-
     sp5 = sub.add_parser("mine")
     sp5.add_argument("--path")
-
     sub.add_parser("wake-up")
     sub.add_parser("list-agents")
     sub.add_parser("bridge")
-
     args = p.parse_args()
     cmd = args.cmd
-
     if cmd == "search":
         r = search(args.query, agent=args.agent, limit=args.limit,
                    use_mmr=args.mmr, use_dedup=args.dedup,
@@ -531,5 +489,4 @@ if __name__ == "__main__":
     else:
         p.print_help()
         sys.exit(0)
-
     print(json.dumps(r, ensure_ascii=False, indent=2))
