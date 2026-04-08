@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-SuperMem v5 — 根因修复完成版
+SuperMem v6 — 第一性原则完整修复版
 ================================================
-修复清单（第一性原则）：
-1. Levenshtein → n-gram Jaccard：O(n×m) → O(n+m)，解决 34秒查询问题
-2. 混合评分 → 分离排名：向量排名 × 关键词排名，解决短文档压制长文档问题
-3. 凭证过滤：store 时检测并拒绝凭证明文存储
-4. MMR 改用 Jaccard：同样消除 Levenshtein 性能瓶颈
+修复清单：
+1. ChromaDB 凭证明文：MEMORY.md 删除凭证 + bridge 同步时过滤
+2. Layer B 1.2x 乘数缺陷：去掉，统一用 ChromaDB cosine similarity
+3. 凭证过滤：bridge 同步时对敏感文件做凭证过滤
+4. Agent 隔离：collection 级别物理隔离，去掉有缺陷的乘数
 """
 import sys, os, json, time, re, glob, argparse, subprocess
 from typing import List, Dict, Any
@@ -47,10 +47,9 @@ def _get_coll(name: str):
     return _get_client().get_or_create_collection(name, metadata={"shared": "true"})
 
 # ============================================================================
-# 3. PURE FUNCTIONS（全部 O(n+m) 复杂度）
+# 3. PURE FUNCTIONS
 # ============================================================================
 def cosine_sim(a, b) -> float:
-    """余弦相似度，兼容 list 或 numpy array。"""
     import numpy as np
     a = np.array(a, dtype=np.float64)
     b = np.array(b, dtype=np.float64)
@@ -61,11 +60,7 @@ def cosine_sim(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 def ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
-    """
-    字符 n-gram Jaccard 相似度。
-    复杂度 O(n+m)，替代 Levenshtein 的 O(n×m)。
-    对 500 字符文档：Levenshtein=几百万次操作，Jaccard=几千次。
-    """
+    """字符 n-gram Jaccard 相似度，O(n+m)。"""
     if not s1 or not s2:
         return 0.0
     def ngrams(s, n):
@@ -79,24 +74,7 @@ def ngram_jaccard(s1: str, s2: str, n: int = 3) -> float:
     union = len(a | b)
     return inter / union if union else 0.0
 
-def levenshtein(s1: str, s2: str) -> float:
-    """编辑距离（仅在少量短字符串时使用）。"""
-    if len(s1) < len(s2): return levenshtein(s2, s1)
-    if len(s2) == 0: return len(s1)
-    p = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        c = [i + 1]
-        for j, c2 in enumerate(s2):
-            c.append(min(p[j+1]+1, c[j]+1, p[j]+(c1!=c2)))
-        p = c
-    return float(p[-1])
-
-def str_sim(s1: str, s2: str) -> float:
-    """短字符串相似度（用于 MMR 后的精确去重）。"""
-    return 1.0 - min(1.0, levenshtein(s1, s2) / max(len(s1), len(s2), 1))
-
 def tokenize_chinese(text: str) -> set:
-    """中文 2-gram + 英文词根，适合短查询。"""
     tokens = set()
     for i in range(len(text) - 1):
         c1, c2 = text[i], text[i+1]
@@ -107,9 +85,6 @@ def tokenize_chinese(text: str) -> set:
     return tokens
 
 def keyword_score(query: str, content: str) -> float:
-    """
-    关键词重叠度：适合短查询的快速匹配。
-    """
     q, c = query.lower(), content.lower()
     if q in c:
         return 2.0
@@ -121,7 +96,6 @@ def keyword_score(query: str, content: str) -> float:
     return 1.0 + overlap / len(q_tokens)
 
 def exact_boost(content: str, query: str) -> float:
-    """完整查询词命中 = 2.0 boost。"""
     if query.lower() in content.lower():
         return 2.0
     terms = [t for t in query.split() if len(t) >= 2]
@@ -136,7 +110,7 @@ def exact_boost(content: str, query: str) -> float:
 def temporal_decay(mtime: float, half_life: int = 30) -> float:
     if not mtime or mtime <= 0:
         return 0.5
-    days = (time.time() - mtime) / 86400
+    days = (time.time() - float(mtime)) / 86400
     return max(0.1, min(1.0, 0.5 ** (days / half_life)))
 
 def parse_filed_at(filed_at_str) -> float:
@@ -180,73 +154,59 @@ def strip(text: str) -> str:
     return text.strip()
 
 # ============================================================================
-# 4. CREDENTIAL FILTER（安全优先）
+# 4. CREDENTIAL FILTER（bridge + store 共享）
 # ============================================================================
 _CRED_PATTERNS = [
-    (r'(?i)google.*?(?:password|密码|passwd)[:\s]*[^\s,}\]]+', '[GOOGLE_PASSWORD]'),
-    (r'(?i)github.*?(?:token|token\s*[:=])[^\s,}\]]+', '[GITHUB_TOKEN]'),
+    (r'(?i)(?:google_email|google_password|github_email|github_password|github_token)[=:][^\s,}\]]+', '[CREDENTIAL]'),
     (r'ghp_[a-zA-Z0-9]{36}', '[GITHUB_TOKEN]'),
-    (r'(?i)(?:api|key|apikey|secret)[:\s]*[^\s,}\]]{8,}', '[API_KEY]'),
-    (r'(?i)password[:\s]*[^\s,}\]]+', '[PASSWORD]'),
-    (r'(?i)token[:\s]*[^\s,}\]]{10,}', '[TOKEN]'),
+    (r'mars\d{4,}', '[PASSWORD]'),
+    (r'Mars\d{4,}', '[PASSWORD]'),
+]
+_CRED_BLOCK_PATTERNS = [
+    r'ghp_[a-zA-Z0-9]{36}',
+    r'mars\d{4,}',
+    r'Mars\d{4,}',
+    r'(?i)(?:password|passwd|pwd|密码|secret|api_?key|token)[:= ]+[a-zA-Z0-9_\-]{4,}',
 ]
 
-def filter_credentials(content: str) -> tuple:
-    """
-    检测并过滤凭证明文。
-    返回 (filtered_content, had_credential)。
-    包含凭证的内容拒绝存储（安全优先）。
-    """
+def filter_credentials(content: str) -> str:
+    """对内容中的凭证明文做过滤替换。"""
     filtered = content
     for pat, repl in _CRED_PATTERNS:
         filtered = re.sub(pat, repl, filtered, flags=re.IGNORECASE)
-    # 如果原始内容包含实际凭证值（而非占位符），拒绝存储
-    danger_patterns = [
-        r'ghp_[a-zA-Z0-9]{36}',
-        r'mars\d{4,}',
-        r'Mars\d{4,}',
-    ]
-    for pat in danger_patterns:
+    return filtered
+
+def has_plaintext_credential(content: str) -> bool:
+    """检测内容是否包含明文凭据（任意真实凭证值）。"""
+    for pat in _CRED_BLOCK_PATTERNS:
         if re.search(pat, content, re.IGNORECASE):
-            return filtered, True
-    return filtered, False
+            return True
+    return False
 
 # ============================================================================
-# 5. FAST DEDUP & RERANK（核心优化）
+# 5. FAST DEDUP & RERANK
 # ============================================================================
 def dedup_fast(results: List[Dict], thresh: float = 0.85) -> List[Dict]:
-    """
-    快速去重：Jaccard 替代 Levenshtein。
-    41 docs: 34s → <0.1s。
-    """
     out = []
     for r in results:
         c = r["content"]
-        is_dup = False
-        for e in out:
-            # 快速 Jaccard 过滤（精确度稍低但快 1000 倍）
-            if ngram_jaccard(c, e["content"], n=3) > thresh:
-                is_dup = True
-                break
+        is_dup = any(
+            ngram_jaccard(c, e["content"], n=3) > thresh
+            for e in out
+        )
         if not is_dup:
             out.append(r)
     return out
 
 def mmr_rerank(results: List[Dict], query: str, lam: float = 0.7, limit: int = 5) -> List[Dict]:
-    """
-    MMR 多样性重排：使用向量余弦相似度作为相关性指标，
-    ngram_jaccard 作为多样性指标。
-    """
     if not results or len(results) <= limit:
         return results
-    # 按向量得分排序
     sorted_by_score = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
     sel, rem = [], list(sorted_by_score)
     while len(sel) < limit and rem:
         best_i, best_s = -1, -float("inf")
         for i, item in enumerate(rem):
             rel = item.get("score", 0)
-            # 多样性：用 ngram_jaccard（快）
             div = 1.0
             if sel:
                 div = max((ngram_jaccard(item["content"], s["content"]) for s in sel), default=0)
@@ -259,10 +219,13 @@ def mmr_rerank(results: List[Dict], query: str, lam: float = 0.7, limit: int = 5
     return sel
 
 # ============================================================================
-# 6. BRIDGE（幂等）
+# 6. BRIDGE（幂等 + 凭证过滤）
 # ============================================================================
 def bridge() -> Dict:
-    """同步 MemPalace → SuperMem，幂等设计。"""
+    """
+    幂等同步 MemPalace → SuperMem。
+    对敏感文件（MEMORY.md, .credentials）做凭证过滤。
+    """
     try:
         import chromadb
         mp = chromadb.PersistentClient(path=os.path.expanduser("~/.mempalace/palace"))
@@ -273,18 +236,20 @@ def bridge() -> Dict:
 
         shared = _get_coll("super_mem_shared")
 
-        # 删除旧格式
+        # 删除旧格式 ID
         all_ids = shared.get(limit=10000, include=[])["ids"]
         old_ids = [mid for mid in all_ids if mid.startswith("mp_") and not mid.startswith("mp_bridge_")]
         if old_ids:
             shared.delete(ids=old_ids)
 
-        # 插入新格式
+        # 重新插入（新格式 + 凭证过滤）
         docs, metas, ids, embs = [], [], [], []
         for i, did in enumerate(items["ids"]):
             doc = items["documents"][i] if items["documents"] else ""
             meta = items["metadatas"][i] if items["metadatas"] else {}
-            docs.append(doc)
+            # 凭证过滤：过滤掉真实凭证值
+            filtered_doc = filter_credentials(doc)
+            docs.append(filtered_doc)
             metas.append({**meta, "source": "mempalace_bridge", "original_id": did})
             ids.append(f"mp_bridge_{did}")
         embs = ollama_embed(docs)
@@ -295,7 +260,7 @@ def bridge() -> Dict:
         return {"error": str(e)}
 
 # ============================================================================
-# 7. CORE SEARCH（分离排名：向量排名 × 关键词排名）
+# 7. CORE SEARCH
 # ============================================================================
 def search(
     query: str,
@@ -303,28 +268,20 @@ def search(
     limit: int = 5,
     use_mmr: bool = True,
     use_dedup: bool = True,
-    use_exact: bool = True,
     use_temporal: bool = True,
     tw: float = 0.3,
     hl: int = 30,
 ) -> Dict[str, Any]:
     """
-    搜索核心：分离排名设计。
+    搜索：Layer A（shared）+ Layer B（agent private）物理合并。
 
     第一性原则：
-    - 向量搜索：语义理解强，适合长查询
-    - 关键词搜索：精确匹配强，适合短查询
-    - 两者正交，分别排名后组合
-
-    旧方案（错误）：score = vec × (vec_norm × 0.6 + kw_norm × 0.4)
-      → 长文档向量投影小，被短文档压制
-
-    新方案（正确）：最终得分 = 向量排名 × 关键词boost
-      → 排名与文档长度无关
+    - Layer A 和 Layer B 用完全相同的 cosine similarity，无人为乘数
+    - 最终得分 = 归一化向量排名 × exact_boost × temporal_decay
+    - 排名与文档长度无关
     """
     clean = strip(query)
     q_emb = ollama_embed([clean])[0]
-
     shared = _get_coll("super_mem_shared")
     agent_coll = _get_coll(f"super_mem_{agent}")
     all_raw: List[Dict] = []
@@ -359,7 +316,7 @@ def search(
     except Exception:
         pass
 
-    # Layer B: agent private
+    # Layer B: agent private（无 1.2x 乘数，与 Layer A 统一标准）
     try:
         res = agent_coll.query(
             query_embeddings=[q_emb],
@@ -374,7 +331,7 @@ def search(
         metas = raw_metas[0] if raw_metas else []
         for i, doc in enumerate(docs):
             emb = layer_embs[i] if i < len(layer_embs) else None
-            vec_score = cosine_sim(q_emb, emb) * 1.2 if emb is not None else 0.0
+            vec_score = cosine_sim(q_emb, emb) if emb is not None else 0.0
             meta = metas[i] if i < len(metas) else {}
             filed_at = meta.get("filed_at", 0)
             mtime = float(filed_at) if filed_at else time.time()
@@ -390,24 +347,17 @@ def search(
         pass
 
     if not all_raw:
-        return {
-            "status": "ok", "query": query, "agent": agent,
-            "results": [], "steps": ["ollama", "empty"]
-        }
+        return {"status": "ok", "query": query, "agent": agent,
+                "results": [], "steps": ["ollama", "empty"]}
 
-    # ===== 分离排名：分别按向量得分和关键词得分排序 =====
+    # 归一化排名得分（与文档长度无关）
     vec_sorted = sorted(all_raw, key=lambda x: x.get("vec_score", 0), reverse=True)
     n = len(vec_sorted)
-
-    for i, r in enumerate(all_raw):
-        # 向量排名（1=最佳）
-        vec_rank = next((j+1 for j, v in enumerate(vec_sorted) if v["content"] == r["content"]), n)
-        # 关键词 boost
-        kw_boost = exact_boost(r["content"], clean)
-        # 最终得分：向量归一化排名 × 关键词boost
-        # rank-based: top item gets n, last gets 1, then multiply by boost
-        rank_score = (n - vec_rank + 1) / n * kw_boost
-        r["score"] = rank_score
+    for r in all_raw:
+        vec_rank = next((j+1 for j, v in enumerate(vec_sorted)
+                         if v["content"] == r["content"]), n)
+        boost = exact_boost(r["content"], clean)
+        r["score"] = (n - vec_rank + 1) / n * boost
 
     steps = ["ollama", "chroma_query", "rank_product"]
 
@@ -438,7 +388,8 @@ def search(
                 "score": round(r["score"], 4),
                 "vec_score": round(r.get("vec_score", 0), 4),
                 "mtime": r.get("mtime", 0),
-                "date": time.strftime("%Y-%m-%d", time.localtime(r.get("mtime", 0))) if r.get("mtime", 0) else "unknown",
+                "date": time.strftime("%Y-%m-%d", time.localtime(r.get("mtime", 0)))
+                           if r.get("mtime", 0) else "unknown",
                 "source": r["source"],
             }
             for r in all_raw
@@ -449,15 +400,13 @@ def search(
 # 8. CRUD + STATUS
 # ============================================================================
 def store(content: str, agent: str = "main", room: str = "general", source: str = "") -> Dict:
-    """存储私人记忆，自动过滤凭证。"""
-    # 安全检查：拒绝凭证明文存储
-    filtered, had_cred = filter_credentials(content)
-    if had_cred:
+    """存储私人记忆。拒绝含明文凭据的内容。"""
+    if has_plaintext_credential(content):
         return {
             "status": "error",
             "error": "CREDENTIAL_DETECTED",
             "message": "内容包含明文凭证，拒绝存储以保护安全",
-            "hint": "凭据已加密存储在 ~/.openclaw/.credentials，不要手动写入记忆"
+            "hint": "凭证已加密存储在 ~/.openclaw/.credentials"
         }
     try:
         coll = _get_coll(f"super_mem_{agent}")
@@ -486,16 +435,13 @@ def status(agent: str = "main") -> Dict:
     try:
         client = _get_client()
         cols = client.list_collections()
-        total = 0
-        info = []
+        total = 0; info = []
         for c in cols:
             try:
                 col = client.get_collection(c.name)
-                cnt = col.count()
-                total += cnt
+                cnt = col.count(); total += cnt
                 info.append({"name": c.name, "count": cnt})
-            except:
-                pass
+            except: pass
         return {"status": "ok", "system": "healthy", "total": total,
                 "collections": sorted(info, key=lambda x: x["name"])}
     except Exception as e:
@@ -529,7 +475,7 @@ def list_agents() -> Dict:
 # MAIN
 # ============================================================================
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="SuperMem v5")
+    p = argparse.ArgumentParser(description="SuperMem v6")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("search")
@@ -538,7 +484,6 @@ if __name__ == "__main__":
     sp.add_argument("--limit", "-n", type=int, default=5)
     sp.add_argument("--no-mmr", dest="mmr", action="store_false", default=True)
     sp.add_argument("--no-dedup", dest="dedup", action="store_false", default=True)
-    sp.add_argument("--no-exact", dest="exact", action="store_false", default=True)
     sp.add_argument("--no-temporal", dest="temporal", action="store_false", default=True)
     sp.add_argument("--tw", type=float, default=0.3)
     sp.add_argument("--hl", type=int, default=30)
@@ -567,7 +512,7 @@ if __name__ == "__main__":
 
     if cmd == "search":
         r = search(args.query, agent=args.agent, limit=args.limit,
-                   use_mmr=args.mmr, use_dedup=args.dedup, use_exact=args.exact,
+                   use_mmr=args.mmr, use_dedup=args.dedup,
                    use_temporal=args.temporal, tw=args.tw, hl=args.hl)
     elif cmd == "status":
         r = status()
