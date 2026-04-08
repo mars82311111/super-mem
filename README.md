@@ -1,8 +1,8 @@
 # SuperMem 🧠
 
-> MemPalace + SM6 精华融合 · AI Agent 记忆系统
+> MemPalace + SM6 精华融合 · 多 Agent 记忆系统
 
-**22k⭐ MemPalace** 的检索质量 + **SM6** 的工程化增强 = 最强本地记忆系统
+**22k⭐ MemPalace** 检索质量 + **SM6** 工程化增强 + **多 Agent 隔离**
 
 [![Stars](https://img.shields.io/github/stars/mars82311111/super-mem)](https://github.com/mars82311111/super-mem)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -20,9 +20,11 @@
 | **Levenshtein 去重** | SM6 | >85% 相似度不重复记录 |
 | **Exact Match 优先** | SM6 | 关键词完整匹配优先级提升 |
 | **元数据自动清洗** | SM6 | 去除系统元数据前缀 |
-| **Hook 自动注入** | SM6 | `message:preprocessed` 全自动触发 |
 | **ChromaDB 删除** | SM6 | 可删除过时记忆 |
 | **子系统健康检查** | SM6 | ChromaDB 抽屉状态一览 |
+| **多 Agent 隔离** | SuperMem | 每个 Agent 独立 ChromaDB Collection |
+| **两层记忆搜索** | SuperMem | 共享文件 + 私有记忆 |
+| **中文 N-gram** | SuperMem | 中文文本语义匹配（2-gram） |
 | **完全本地运行** | MemPalace | 无需 API key |
 
 ---
@@ -30,22 +32,8 @@
 ## 🚀 一键安装
 
 ```bash
-# 方法1: 一键安装（推荐）
 curl -sSL https://raw.githubusercontent.com/mars82311111/super-mem/main/scripts/install.sh | bash
-
-# 方法2: 手动安装
-git clone https://github.com/mars82311111/super-mem.git ~/super-mem
-cd ~/super-mem
-chmod +x scripts/install.sh
-./scripts/install.sh
 ```
-
-安装脚本会自动：
-1. 安装 MemPalace (`pip install mempalace`)
-2. 安装 ChromaDB 依赖
-3. 初始化记忆系统
-4. 配置 OpenClaw Hook（自动记忆注入）
-5. 挖掘 workspace
 
 ---
 
@@ -53,26 +41,47 @@ chmod +x scripts/install.sh
 
 ### 增强搜索（默认）
 ```bash
-# 搜索 - 自动应用：时间衰减 + Exact Match 优先 + MMR + 去重
 python3 scripts/super_mem_cli.py search "查询内容"
 
 # 指定时间衰减权重（0.0=只看相关性，1.0=只看新旧）
-python3 scripts/super_mem_cli.py search "查询" --temporal-weight 0.3
+python3 scripts/super_mem_cli.py search "查询" --tw 0.3
 
 # 设置记忆半衰期（天）
-python3 scripts/super_mem_cli.py search "查询" --half-life-days 30
+python3 scripts/super_mem_cli.py search "查询" --hl 30
 
-# 关闭 Exact Match 优先
-python3 scripts/super_mem_cli.py search "查询" --no-exact-boost
+# 关闭某些增强
+python3 scripts/super_mem_cli.py search "查询" --no-mmr --no-dedup
+```
 
-# 关闭 MMR 多样性重排
-python3 scripts/super_mem_cli.py search "查询" --no-mmr
+### 多 Agent 搜索
+```bash
+# 主 Agent（CEO）搜索
+python3 scripts/super_mem_cli.py search "查询" --agent main
+
+# 子 Agent 搜索
+python3 scripts/super_mem_cli.py search "查询" --agent planner
+python3 scripts/super_mem_cli.py search "查询" --agent coder
+```
+
+### 存储私人记忆
+```bash
+# 存储到当前 Agent 的私有 Collection
+python3 scripts/super_mem_cli.py remember "记住城总喜欢暗色模式" --agent main --room preferences
 ```
 
 ### 健康检查
 ```bash
-python3 scripts/super_mem_cli.py status
-# 返回: 抽屉数、总记忆数、各分类状态
+python3 scripts/super_mem_cli.py status --agent main
+```
+
+### 删除记忆
+```bash
+python3 scripts/super_mem_cli.py forget <memory_id> --agent main
+```
+
+### 增量挖掘
+```bash
+python3 scripts/super_mem_cli.py mine --agent main --path /your/workspace
 ```
 
 ### 启动唤醒
@@ -80,106 +89,101 @@ python3 scripts/super_mem_cli.py status
 python3 scripts/super_mem_cli.py wake-up
 ```
 
-### 删除记忆
+### 列出所有 Agent
 ```bash
-python3 scripts/super_mem_cli.py forget <memory_id>
-```
-
-### 增量挖掘
-```bash
-python3 scripts/super_mem_cli.py mine --path /your/workspace
+python3 scripts/super_mem_cli.py list-agents
 ```
 
 ---
 
-## 🔧 OpenClaw 集成
+## 🏗️ 多 Agent 架构
 
-### Hook 自动触发（推荐）
-安装后 OpenClaw 会自动在每次消息时触发 `mempalace-recall` hook，无需手动 recall。
+```
+┌─────────────────────────────────────────────────────────┐
+│                    SuperMem Memory                        │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌──────────────────┐     ┌──────────────────────────┐  │
+│  │  mempalace_drawers │     │   Per-Agent Collections   │  │
+│  │  (共享·文件挖掘)    │     │                          │  │
+│  │                    │     │  ┌─ mempalace_main ──┐  │  │
+│  │  从 workspace     │     │  │  CEO 私有记忆       │  │  │
+│  │  文件自动挖掘     │     │  └───────────────────┘  │  │
+│  │                    │     │  ┌─ mempalace_planner┐  │  │
+│  │  所有 Agent 共享   │     │  │  Planner 私有记忆   │  │  │
+│  │  不可删除          │     │  └───────────────────┘  │  │
+│  └──────────────────┘     │  ┌─ mempalace_coder ──┐  │  │
+│                            │  │  Coder 私有记忆    │  │  │
+│                            │  └───────────────────┘  │  │
+│                            └──────────────────────────┘  │
+│                                                          │
+│  搜索流程：                                              │
+│  1. 搜 mempalace_drawers（共享）                        │
+│  2. 搜 mempalace_{agent}（私有）                        │
+│  3. Exact Match Boost                                   │
+│  4. Temporal Decay                                      │
+│  5. Levenshtein 去重                                    │
+│  6. MMR 多样性重排                                       │
+└─────────────────────────────────────────────────────────┘
+```
 
-### 手动触发
-在 OpenClaw 对话中直接调用 CLI 工具。
+### 隔离保证
+
+- **主 Agent（main）**：可读写 `mempalace_drawers`（共享）+ `mempalace_main`（私有）
+- **子 Agent（planner/coder）**：可读写 `mempalace_drawers`（共享）+ `mempalace_{agent}`（私有）
+- **私有 Collection 不交叉**：planner 无法读取 main 的私有记忆
+- **共享文件统一挖掘**：`mempalace_drawers` 由 workspace 自动维护，所有 Agent 共享
 
 ---
 
-## 🏗️ 系统架构
+## 🔧 设计原则
+
+### 不串联（No Cascading）
+
+所有增强逻辑均为**纯函数**，按序执行、无状态共享：
 
 ```
-消息入口 (message:preprocessed hook)
-  ↓
-1. strip_metadata() — 清洗元数据
-  ↓
-2. MemPalace 混合搜索 — BM25 + 向量 + 图遍历
-  ↓
-3. Exact Match Boost — 关键词完整匹配 ×2.0
-  ↓
-4. Levenshtein 去重 — >85% 相似度去除
-  ↓
-5. Temporal Decay — 文件修改时间衰减
-  ↓
-6. MMR 多样性重排 — 主题多样性保证
-  ↓
-7. 注入 bodyForAgent → 模型响应
+mempalace search → exact_match_boost() → temporal_decay() → dedup() → mmr()
+     ↓                    ↓                   ↓              ↓         ↓
+  原始结果           纯函数transform      纯函数transform  纯函数transform 纯函数transform
 ```
+
+每一步都是独立的 transform，不依赖上一步的副作用。
+
+### 完全融合
+
+- 不拆分服务、不创建进程链
+- 单文件 CLI、一个 Hook、一个 Collection
+- 故障率低、易调试、易维护
 
 ---
 
-## 📊 时间衰减机制
+## ⚙️ 参数说明
 
-```
-Score = base_score × (1 - λ) + decay(mtime) × λ
-
-λ = temporal_weight (默认 0.3)
-decay = 0.5^(days_elapsed / half_life_days)
-half_life_days = 30 (默认)
-
-效果: 30天前记忆的decay分约0.5，权重0.3时对总分影响约15%
-```
-
----
-
-## 📦 目录结构
-
-```
-super-mem/
-├── scripts/
-│   ├── install.sh              # 一键安装脚本
-│   └── super_mem_cli.py       # 增强版 CLI（MMR + 去重 + 时间衰减 + Exact优先）
-├── skills/
-│   └── mempalace-memory/
-│       └── SKILL.md          # OpenClaw Skill 说明
-├── hooks/
-│   └── mempalace-recall/
-│       ├── HOOK.md            # Hook 说明
-│       └── handler.ts         # TypeScript Hook 实现
-└── README.md
-```
-
----
-
-## 🆚 vs 其他记忆系统
-
-| 系统 | Stars | API Key | 时间衰减 | Exact优先 | 自动Hook |
-|------|-------|---------|---------|---------|---------|
-| **SuperMem** | - | ❌ 不需要 | ✅ | ✅ | ✅ |
-| OpenViking | 21k | ⚠️ 需要 | ❌ | ❌ | ❌ |
-| MemPalace | 22k | ❌ 不需要 | ❌ | ❌ | ❌ |
-| SM6 | - | ⚠️ 需要 | ✅ | ✅ | ❌ (不稳定) |
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--agent` | Agent ID，决定搜索哪个私有 Collection | `main` |
+| `--tw` | 时间衰减权重（0.0-1.0） | `0.3` |
+| `--hl` | 记忆半衰期（天） | `30` |
+| `--limit` | 返回结果数 | `5` |
+| `--no-mmr` | 禁用 MMR 多样性重排 | False |
+| `--no-dedup` | 禁用 Levenshtein 去重 | False |
+| `--no-exact` | 禁用 Exact Match 优先 | False |
+| `--no-temporal` | 禁用时间衰减 | False |
 
 ---
 
 ## ⚙️ 系统要求
 
 - Python 3.9+
-- OpenClaw (用于 Hook 集成)
-- Git
-- pip
+- OpenClaw（用于 Hook 集成）
+- Git、pip
 
 ---
 
 ## 📄 License
 
-MIT — 随便用，引用来源即可。
+MIT
 
 ---
 
